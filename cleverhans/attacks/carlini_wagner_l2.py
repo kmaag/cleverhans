@@ -3,6 +3,7 @@
 # pylint: disable=missing-docstring
 import logging
 
+import os
 import numpy as np
 import tensorflow as tf
 
@@ -10,6 +11,8 @@ from cleverhans.attacks.attack import Attack
 from cleverhans.compat import reduce_sum, reduce_max
 from cleverhans.model import CallableModelWrapper, Model, wrapper_warning_logits
 from cleverhans import utils
+
+from global_defs import CONFIG
 
 np_dtype = np.dtype('float32')
 tf_dtype = tf.as_dtype('float32')
@@ -50,9 +53,8 @@ class CarliniWagnerL2(Attack):
     self.feedable_kwargs = ('y', 'y_target')
 
     self.structural_kwargs = [
-        'batch_size', 'confidence', 'targeted', 'learning_rate',
-        'binary_search_steps', 'max_iterations', 'abort_early',
-        'initial_const', 'clip_min', 'clip_max'
+        'batch_size', 'confidence', 'targeted', 'learning_rate', 'const_a_min',
+        'const_a_max', 'max_iterations', 'clip_min', 'clip_max'
     ]
 
   def generate(self, x, **kwargs):
@@ -70,14 +72,14 @@ class CarliniWagnerL2(Attack):
     labels, nb_classes = self.get_or_guess_labels(x, kwargs)
 
     attack = CWL2(self.sess, self.model, self.batch_size, self.confidence,
-                  'y_target' in kwargs, self.learning_rate,
-                  self.binary_search_steps, self.max_iterations,
-                  self.abort_early, self.initial_const, self.clip_min,
-                  self.clip_max, nb_classes,
-                  x.get_shape().as_list()[1:])
-
+                  'y_target' in kwargs, self.learning_rate, self.const_a_min,
+                  self.const_a_max, self.max_iterations, self.clip_min, self.clip_max,
+                  nb_classes, x.get_shape().as_list()[1:])
+    
+    self.counter_x = -1 
     def cw_wrap(x_val, y_val):
-      return np.array(attack.attack(x_val, y_val), dtype=self.np_dtype)
+      self.counter_x += 1
+      return np.array(attack.attack(x_val, y_val, self.counter_x), dtype=self.np_dtype)
 
     wrap = tf.py_func(cw_wrap, [x, labels], self.tf_dtype)
     wrap.set_shape(x.get_shape())
@@ -90,10 +92,9 @@ class CarliniWagnerL2(Attack):
                    batch_size=1,
                    confidence=0,
                    learning_rate=5e-3,
-                   binary_search_steps=5,
+                   const_a_min=1e-2,
+                   const_a_max=1e10,
                    max_iterations=1000,
-                   abort_early=True,
-                   initial_const=1e-2,
                    clip_min=0,
                    clip_max=1):
     """
@@ -109,24 +110,13 @@ class CarliniWagnerL2(Attack):
     :param learning_rate: The learning rate for the attack algorithm.
                           Smaller values produce better results but are
                           slower to converge.
-    :param binary_search_steps: The number of times we perform binary
-                                search to find the optimal tradeoff-
-                                constant between norm of the purturbation
-                                and confidence of the classification.
+    :param const_a_min: The constant value for parameter a (min).
+    :param const_a_max: The constant value for parameter a (max).
     :param max_iterations: The maximum number of iterations. Setting this
                            to a larger value will produce lower distortion
                            results. Using only a few iterations requires
                            a larger learning rate, and will produce larger
                            distortion results.
-    :param abort_early: If true, allows early aborts if gradient descent
-                        is unable to make progress (i.e., gets stuck in
-                        a local minimum).
-    :param initial_const: The initial tradeoff-constant to use to tune the
-                          relative importance of size of the perturbation
-                          and confidence of classification.
-                          If binary_search_steps is large, the initial
-                          constant is not important. A smaller value of
-                          this constant gives lower distortion results.
     :param clip_min: (optional float) Minimum input component value
     :param clip_max: (optional float) Maximum input component value
     """
@@ -135,10 +125,9 @@ class CarliniWagnerL2(Attack):
     self.batch_size = batch_size
     self.confidence = confidence
     self.learning_rate = learning_rate
-    self.binary_search_steps = binary_search_steps
+    self.const_a_min = np.ones(batch_size)*const_a_min
+    self.const_a_max = np.ones(batch_size)*const_a_max
     self.max_iterations = max_iterations
-    self.abort_early = abort_early
-    self.initial_const = initial_const
     self.clip_min = clip_min
     self.clip_max = clip_max
 
@@ -149,9 +138,9 @@ def ZERO():
 
 class CWL2(object):
   def __init__(self, sess, model, batch_size, confidence, targeted,
-               learning_rate, binary_search_steps, max_iterations,
-               abort_early, initial_const, clip_min, clip_max, num_labels,
-               shape):
+               learning_rate, const_a_min, const_a_max, max_iterations, 
+               clip_min, clip_max, num_labels, shape):
+               
     """
     Return a tensor that constructs adversarial examples for the given
     input. Generate uses tf.py_func in order to operate over tensors.
@@ -169,24 +158,13 @@ class CWL2(object):
     :param learning_rate: The learning rate for the attack algorithm.
                           Smaller values produce better results but are
                           slower to converge.
-    :param binary_search_steps: The number of times we perform binary
-                                search to find the optimal tradeoff-
-                                constant between norm of the purturbation
-                                and confidence of the classification.
+    :param const_a_min: The constant value for parameter a (min).
+    :param const_a_max: The constant value for parameter a (max).
     :param max_iterations: The maximum number of iterations. Setting this
                            to a larger value will produce lower distortion
                            results. Using only a few iterations requires
                            a larger learning rate, and will produce larger
                            distortion results.
-    :param abort_early: If true, allows early aborts if gradient descent
-                        is unable to make progress (i.e., gets stuck in
-                        a local minimum).
-    :param initial_const: The initial tradeoff-constant to use to tune the
-                          relative importance of size of the pururbation
-                          and confidence of classification.
-                          If binary_search_steps is large, the initial
-                          constant is not important. A smaller value of
-                          this constant gives lower distortion results.
     :param clip_min: (optional float) Minimum input component value.
     :param clip_max: (optional float) Maximum input component value.
     :param num_labels: the number of classes in the model's output.
@@ -197,16 +175,13 @@ class CWL2(object):
     self.TARGETED = targeted
     self.LEARNING_RATE = learning_rate
     self.MAX_ITERATIONS = max_iterations
-    self.BINARY_SEARCH_STEPS = binary_search_steps
-    self.ABORT_EARLY = abort_early
+    self.CONST_A_MIN = const_a_min
+    self.CONST_A_MAX = const_a_max
     self.CONFIDENCE = confidence
-    self.initial_const = initial_const
     self.batch_size = batch_size
     self.clip_min = clip_min
     self.clip_max = clip_max
     self.model = model
-
-    self.repeat = binary_search_steps >= 10
 
     self.shape = shape = tuple([batch_size] + list(shape))
 
@@ -257,11 +232,17 @@ class CWL2(object):
     self.loss2 = reduce_sum(self.l2dist)
     self.loss1 = reduce_sum(self.const * loss1)
     self.loss = self.loss1 + self.loss2
-
+    
     # Setup the adam optimizer and keep track of variables we're creating
     start_vars = set(x.name for x in tf.global_variables())
-    optimizer = tf.train.AdamOptimizer(self.LEARNING_RATE)
-    self.train = optimizer.minimize(self.loss, var_list=[modifier])
+    batch_step = tf.Variable(99, trainable=False)
+    learn_rate = tf.train.inverse_time_decay(learning_rate=self.LEARNING_RATE*100,
+                                             global_step=batch_step * batch_size,
+                                             decay_steps=1.0, decay_rate=1.0)
+    optimizer = tf.train.MomentumOptimizer(learning_rate=learn_rate, momentum=0.0,
+                                           use_nesterov=False)
+    # Passing batch_step to minimize() will increment it at each step
+    self.train = optimizer.minimize(self.loss, var_list=[modifier], global_step=batch_step)
     end_vars = tf.global_variables()
     new_vars = [x for x in end_vars if x.name not in start_vars]
 
@@ -273,18 +254,18 @@ class CWL2(object):
 
     self.init = tf.variables_initializer(var_list=[modifier] + new_vars)
 
-  def attack(self, imgs, targets):
+  def attack(self, imgs, targets, counter_x):
     """
     Perform the L_2 attack on the given instance for the given targets.
 
     If self.targeted is true, then the targets represents the target labels
     If self.targeted is false, then targets are the original class labels
     """
-
+    self.counter_x = counter_x
     r = []
     for i in range(0, len(imgs), self.batch_size):
       _logger.debug(
-          ("Running CWL2 attack on instance %s of %s", i, len(imgs)))
+          ("Running CWL2 attack on instance", i, " of ", len(imgs)))
       r.extend(
           self.attack_batch(imgs[i:i + self.batch_size],
                             targets[i:i + self.batch_size]))
@@ -307,7 +288,7 @@ class CWL2(object):
         return x == y
       else:
         return x != y
-
+    
     batch_size = self.batch_size
 
     oimgs = np.clip(imgs, self.clip_min, self.clip_max)
@@ -319,31 +300,32 @@ class CWL2(object):
     imgs = (imgs * 2) - 1
     # convert to tanh-space
     imgs = np.arctanh(imgs * .999999)
-
-    # set the lower and upper bounds accordingly
-    lower_bound = np.zeros(batch_size)
-    CONST = np.ones(batch_size) * self.initial_const
-    upper_bound = np.ones(batch_size) * 1e10
-
+    
     # placeholders for the best l2, score, and instance attack found so far
     o_bestl2 = [1e10] * batch_size
-    o_bestscore = [-1] * batch_size
     o_bestattack = np.copy(oimgs)
 
-    for outer_step in range(self.BINARY_SEARCH_STEPS):
+    # set the lower and upper bounds accordingly
+    if CONFIG.DATASET == 'moon':
+      if self.CONST_A_MIN == -1:
+        param_b = np.load(CONFIG.SAVE_PATH + 'data/param_b.npy')
+        CONST = np.ones(batch_size) * param_b[int((self.counter_x)/2)]
+      else:
+        lower_bound = np.ones(batch_size) * self.CONST_A_MIN
+        CONST = np.ones(batch_size) * self.CONST_A_MIN
+        upper_bound = np.ones(batch_size) * self.CONST_A_MAX
+    else:
+      lower_bound = np.zeros(batch_size)
+      CONST = np.ones(batch_size) * 1e-2
+      upper_bound = np.ones(batch_size) * 1e10
+    
+    o_bestconst = CONST.copy()
+    
+    if CONFIG.DATASET == 'moon' and self.CONST_A_MIN == -1:
       # completely reset adam's internal state.
       self.sess.run(self.init)
       batch = imgs[:batch_size]
       batchlab = labs[:batch_size]
-
-      bestl2 = [1e10] * batch_size
-      bestscore = [-1] * batch_size
-      _logger.debug("  Binary search step %s of %s",
-                    outer_step, self.BINARY_SEARCH_STEPS)
-
-      # The last iteration (if we run many steps) repeat the search once.
-      if self.repeat and outer_step == self.BINARY_SEARCH_STEPS - 1:
-        CONST = upper_bound
 
       # set the variables so that we don't have to send them over again
       self.sess.run(
@@ -352,64 +334,121 @@ class CWL2(object):
               self.assign_tlab: batchlab,
               self.assign_const: CONST
           })
-
-      prev = 1e6
+      
+      flag_break = 0
       for iteration in range(self.MAX_ITERATIONS):
-        # perform the attack
+        
+        if flag_break == 1:
+          break
+        
         _, l, l2s, scores, nimg = self.sess.run([
             self.train, self.loss, self.l2dist, self.output,
             self.newimg
-        ])
+        ]) 
 
         if iteration % ((self.MAX_ITERATIONS // 10) or 1) == 0:
           _logger.debug(("    Iteration {} of {}: loss={:.3g} " +
-                         "l2={:.3g} f={:.3g}").format(
-                             iteration, self.MAX_ITERATIONS, l,
-                             np.mean(l2s), np.mean(scores)))
-
-        # check if we should abort search if we're getting nowhere.
-        if self.ABORT_EARLY and \
-           iteration % ((self.MAX_ITERATIONS // 10) or 1) == 0:
-          if l > prev * .9999:
-            msg = "    Failed to make progress; stop early"
-            _logger.debug(msg)
-            break
-          prev = l
+                          "l2={:.3g} f={:.3g}").format(
+                              iteration, self.MAX_ITERATIONS, l,
+                              np.mean(l2s), np.mean(scores)))
 
         # adjust the best result found so far
         for e, (l2, sc, ii) in enumerate(zip(l2s, scores, nimg)):
           lab = np.argmax(batchlab[e])
-          if l2 < bestl2[e] and compare(sc, lab):
-            bestl2[e] = l2
-            bestscore[e] = np.argmax(sc)
-          if l2 < o_bestl2[e] and compare(sc, lab):
+          o_bestattack[e] = ii
+          if compare(sc, lab):
             o_bestl2[e] = l2
-            o_bestscore[e] = np.argmax(sc)
-            o_bestattack[e] = ii
-
-      # adjust the constant as needed
-      for e in range(batch_size):
-        if compare(bestscore[e], np.argmax(batchlab[e])) and \
-           bestscore[e] != -1:
-          # success, divide const by two
-          upper_bound[e] = min(upper_bound[e], CONST[e])
-          if upper_bound[e] < 1e9:
-            CONST[e] = (lower_bound[e] + upper_bound[e]) / 2
-        else:
-          # failure, either multiply by 10 if no solution found yet
-          #          or do binary search with the known upper bound
-          lower_bound[e] = max(lower_bound[e], CONST[e])
-          if upper_bound[e] < 1e9:
-            CONST[e] = (lower_bound[e] + upper_bound[e]) / 2
-          else:
-            CONST[e] *= 10
+            flag_break = 1
+            break
+            
       _logger.debug("  Successfully generated adversarial examples " +
-                    "on {} of {} instances.".format(
-                        sum(upper_bound < 1e9), batch_size))
+                    " of {} instances.".format(batch_size))
       o_bestl2 = np.array(o_bestl2)
       mean = np.mean(np.sqrt(o_bestl2[o_bestl2 < 1e9]))
       _logger.debug("   Mean successful distortion: {:.4g}".format(mean))
+    
+    else:   
+        
+      flag_compare = 0
+      self.BINARY_SEARCH_STEPS = 5
+      self.repeat = self.BINARY_SEARCH_STEPS >= 10
+    
+      for outer_step in range(self.BINARY_SEARCH_STEPS):
+        # completely reset adam's internal state.
+        self.sess.run(self.init)
+        batch = imgs[:batch_size]
+        batchlab = labs[:batch_size]
 
+        bestl2 = [1e10] * batch_size
+        bestscore = [-1] * batch_size
+        _logger.debug("  Binary search step %s of %s",
+                      outer_step, self.BINARY_SEARCH_STEPS)
+
+        # The last iteration (if we run many steps) repeat the search once.
+        if self.repeat and outer_step == self.BINARY_SEARCH_STEPS - 1:
+          CONST = upper_bound
+
+        # set the variables so that we don't have to send them over again
+        self.sess.run(
+            self.setup, {
+                self.assign_timg: batch,
+                self.assign_tlab: batchlab,
+                self.assign_const: CONST
+            })
+
+        for iteration in range(self.MAX_ITERATIONS):
+          # perform the attack
+          _, l, l2s, scores, nimg = self.sess.run([
+              self.train, self.loss, self.l2dist, self.output,
+              self.newimg
+          ])
+
+          if iteration % ((self.MAX_ITERATIONS // 10) or 1) == 0:
+            _logger.debug(("    Iteration {} of {}: loss={:.3g} " +
+                          "l2={:.3g} f={:.3g}").format(
+                              iteration, self.MAX_ITERATIONS, l,
+                              np.mean(l2s), np.mean(scores)))
+
+          # adjust the best result found so far
+          for e, (l2, sc, ii) in enumerate(zip(l2s, scores, nimg)):
+            lab = np.argmax(batchlab[e])
+            if l2 < bestl2[e] and compare(sc, lab):
+              bestl2[e] = l2
+              bestscore[e] = np.argmax(sc)
+            if compare(sc, lab):
+              o_bestl2[e] = l2
+              o_bestattack[e] = ii
+              o_bestconst[e] = CONST[e]
+              flag_compare = 1
+            if flag_compare == 0:
+              o_bestattack[e] = ii
+
+        # adjust the constant as needed
+        for e in range(batch_size):
+          if compare(bestscore[e], np.argmax(batchlab[e])) and \
+            bestscore[e] != -1:
+            # success, divide const by two
+            upper_bound[e] = min(upper_bound[e], CONST[e])
+            if upper_bound[e] < 1e9:
+              CONST[e] = (lower_bound[e] + upper_bound[e]) / 2
+          else:
+            # failure, either multiply by 10 if no solution found yet
+            #          or do binary search with the known upper bound
+            lower_bound[e] = max(lower_bound[e], CONST[e])
+            if upper_bound[e] < 1e9:
+              CONST[e] = (lower_bound[e] + upper_bound[e]) / 2
+            else:
+              CONST[e] *= 10
+        _logger.debug("  Successfully generated adversarial examples " +
+                      "on {} of {} instances.".format(
+                          sum(upper_bound < 1e9), batch_size))
+        o_bestl2 = np.array(o_bestl2)
+        mean = np.mean(np.sqrt(o_bestl2[o_bestl2 < 1e9]))
+        _logger.debug("   Mean successful distortion: {:.4g}".format(mean))
+        
     # return the best solution found
-    o_bestl2 = np.array(o_bestl2)
     return o_bestattack
+  
+  
+  
+  

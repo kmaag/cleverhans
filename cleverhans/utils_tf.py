@@ -193,7 +193,7 @@ def train(sess, loss, x, y, X_train, Y_train, save=False,
   return True
 
 
-def model_eval(sess, x, y, predictions, X_test=None, Y_test=None,
+def model_eval(sess, x, y, predictions, adv_x, nb_classes, X_test=None, Y_test=None,
                feed=None, args=None):
   """
   Compute the accuracy of a TF model on some data
@@ -201,6 +201,7 @@ def model_eval(sess, x, y, predictions, X_test=None, Y_test=None,
   :param x: input placeholder
   :param y: output placeholder (for labels)
   :param predictions: model output predictions
+  :param adv_x: attacked images
   :param X_test: numpy array with training inputs
   :param Y_test: numpy array with training outputs
   :param feed: An optional dictionary that is appended to the feeding
@@ -209,7 +210,15 @@ def model_eval(sess, x, y, predictions, X_test=None, Y_test=None,
   :param args: dict or argparse `Namespace` object.
                Should contain `batch_size`
   :return: a float with the accuracy value
+           numpy array with model output predictions
+           numpy array with attacked images
   """
+  
+  # initialize return arrays
+  predictions_np = np.zeros((X_test.shape[0],nb_classes))
+  adv_x_np = np.zeros((X_test.shape[0],X_test.shape[1],X_test.shape[2],X_test.shape[3]))
+  counter = 0
+  
   global _model_eval_cache
   args = _ArgsWrapper(args or {})
 
@@ -231,6 +240,8 @@ def model_eval(sess, x, y, predictions, X_test=None, Y_test=None,
   accuracy = 0.0
 
   with sess.as_default():
+    initialize_uninitialized_global_variables(sess)
+    
     # Compute number of batches
     nb_batches = int(math.ceil(float(len(X_test)) / args.batch_size))
     assert nb_batches * args.batch_size >= len(X_test)
@@ -258,15 +269,20 @@ def model_eval(sess, x, y, predictions, X_test=None, Y_test=None,
       if feed is not None:
         feed_dict.update(feed)
       cur_corr_preds = correct_preds.eval(feed_dict=feed_dict)
-
+      
       accuracy += cur_corr_preds[:cur_batch_size].sum()
+    
+      predictions_np[counter,:], adv_x_np[counter,:,:,:] = sess.run([predictions, adv_x],
+                                                                    feed_dict=feed_dict)
+      
+      counter += 1
 
     assert end >= len(X_test)
 
     # Divide by number of examples to get final value
     accuracy /= len(X_test)
 
-  return accuracy
+  return accuracy, predictions_np, adv_x_np
 
 _model_eval_cache = {}
 
